@@ -1,0 +1,9 @@
+# Probe overlay. Deep-merged over the active profile's config at
+# materialize time, so model wiring and credentials are inherited and only
+# these probe-specific keys differ.
+agent:
+  max_turns: 60
+approvals:
+  mode: smart
+security:
+  redact_secrets: true
