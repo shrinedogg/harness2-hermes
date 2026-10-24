@@ -98,11 +98,28 @@ probe profile's config).
   `transcript.jsonl` copy is made if the profile writes one.
 - Deliverables stay under `<probe>/ws/out/`.
 
-## First commit
+## Quickstart
 
-The repo is git-initialized with no commits. Once `base/` is what you want as
-H0:
+Requirements: a working Hermes install with at least one usable profile to
+clone from (any of them), Python 3.9+.
 
+```bash
+git clone <this repo> && cd harness2-hermes
+# The active profile's config is the base; probes clone it and overlay base/config.yaml.
+bash scripts/smoke.sh        # runs the reference probe once, end-to-end
 ```
-git add -A && git commit -m "harness2-hermes: base harness H0 + loop scaffold"
-```
+
+`smoke.sh` exiting 0 means the full chain works: profile materialization,
+probe session, deliverable verification, cleanup. From there, follow the
+per-task protocol above with your own task in `runs/<task>/task.md`.
+
+## Post-update smoke test
+
+Hermes CLI/config contracts can drift between versions. `scripts/smoke.sh`
+is version-gated: it only re-runs the probe when the hermes version differs
+from `runs/.last-green-version` (last green run), appends the outcome to
+`runs/update-log.md`, and updates the marker on success. Wire it to any
+scheduler (cron, launchd, a Hermes cron job with a version+marker monitor
+script) and the loop self-tests on every Hermes update; on failure the
+failing trajectory is in `runs/<task>/<probe>/stdout.log` for diagnosing the
+drift.

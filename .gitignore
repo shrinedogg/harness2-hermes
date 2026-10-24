@@ -1,0 +1,8 @@
+# Local run state (machine-specific; the smoke test writes these)
+runs/.last-green-version
+runs/update-log.md
+
+# Regenerable probe artifacts (trajectories, workspaces)
+runs/*/ws/
+runs/*/stdout.log
+runs/*/transcript.jsonl
