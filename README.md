@@ -1,124 +1,160 @@
 # harness2
 
-The [Harness^2](https://arxiv.org/abs/2610.14224) self-improvement loop,
-rebuilt as a first-class Hermes plugin. For a class of work, the plugin
-refines the agent's own execution harness — system prompt, config overlay,
-skills — with a contrastive **Propose → Probe → Compose** cycle over
-isolated, wall-clock-budgeted probe sessions, and banks the evidence-backed
-lessons in a per-profile **improvement library** that future tasks read
-before editing.
+harness2 is a Hermes plugin that makes the agent better at a class of work.
+It follows the loop from the
+[Harness^2 paper](https://arxiv.org/abs/2610.14224)
+([google-research/harness2](https://github.com/google-research/harness2)).
+The loop runs a task. It proposes edits to the agent's own harness. It
+re-runs the task in fresh sessions under the edited harness. It keeps only
+the edits the evidence supports. It saves the lessons in a library that the
+next run reads first.
 
-The harness is a Hermes profile. A probe is a fresh one-shot `hermes -p
-<probe> chat` session in a clone of the active profile carrying exactly one
-harness tree. The library is durable plugin state: adopted harness trees
-plus the `EXPERIENCE.md` entries the reflector writes.
+A **harness** is the set of files that shape how an agent works: a system
+prompt, a configuration overlay, and on-demand skills. A **probe** is one
+test run of the task in a fresh session. The **library** holds the adopted
+harnesses and the saved lessons.
 
-This is what a skill cannot do: a skill is advice read by one agent. This
-plugin spawns real sessions under candidate harnesses, captures their full
-trajectories, gates the edits structurally, and makes the lessons durable —
-the loop runs inside any Hermes profile and accumulates per profile.
+The plugin has two parts:
 
-## Install
+- **Tools that run the loop.** Eight `harness2_*` tools do the mechanical
+  work. They start a run, clone a profile, and run budgeted test sessions.
+  They capture each session's full trajectory, and they block broken edits
+  with a structural gate. The code is deterministic Python.
+- **Skills that steer the judgment.** Five bundled skills (`harness2:run`,
+  `harness2:propose`, `harness2:compose`, `harness2:select`,
+  `harness2:reflect`) tell the agent how to do the thinking stages. They
+  point at the stage prompts from the paper's appendix, which ship verbatim
+  in `assets/prompts/`.
 
-```bash
+You need a working Hermes install (version 0.22 or newer) with at least one
+profile. You need no API keys and no Python dependencies. PyYAML ships
+with Hermes.
+
+## What you get
+
+- One sentence starts a full improvement round for a task.
+- Every test run is isolated: its own profile, its own workspace, a
+  wall-clock budget, and a captured trajectory you can read.
+- A structural gate blocks broken harness edits before they run.
+- An improvement library per profile. Every later run reads it first.
+- No changes to your files: all run state lives in the plugin data
+  directory, which survives plugin updates.
+
+## Quickstart
+
+### Step 1: Install the plugin
+
+```sh
 hermes plugins install harness2      # from the catalog
 hermes plugins enable harness2
 ```
 
-No API keys, no Python dependencies (PyYAML ships with Hermes).
+To install from a clone instead, copy the repo to
+`~/.hermes/plugins/harness2`.
 
-## Quickstart
+### Step 2: Start the loop
 
-Ask for the loop, in any session:
+In any chat session, send:
 
 ```
 Run the harness2 loop for this task:
-<verbatim task request, with a path to source material if any>
+<the task, word for word, with a path to source material if any>
 ```
 
-The agent loads the bundled `harness2:run` skill and drives the whole round:
-reference probe under the unmodified harness, two candidate editors (one on
-*how the agent works*, one on *what a practitioner knows*), probes of both
-candidates, a composer that merges what the evidence supports, a successor
-probe, the reflector, and the library entry. `harness2_status` reports
-progress at any point; an interrupted loop resumes from the first missing
-stage.
+The agent loads the `harness2:run` skill and drives the round. If you stop
+the session, the loop resumes from the first missing stage.
+
+### Step 3: Check progress and results
+
+```
+harness2_status {"task": "<slug>"}
+harness2_library {"action": "list"}
+```
+
+The first command reports round progress. The second lists the saved
+lessons.
 
 ## The loop
 
-| Stage | Who | What happens |
+| Stage | Who does it | What happens |
 |---|---|---|
-| Init | `harness2_init` | Verbatim task + source material in the run dir |
-| Reference | `harness2_probe` (base) | k rollouts under the unmodified harness |
-| Propose | `harness2:propose` + `harness2_seed`/`check` | Two disjoint candidate trees, structurally gated |
-| Probe | `harness2_probe` (candidates) | One rollout per candidate, isolated profiles |
-| Compose | `harness2:compose` + `harness2_check` | Merge / adopt wholesale / KEEP_BASE |
-| Successor | `harness2_probe` (composed) | The adopted harness on-policy |
-| Select (k>1) | `harness2:select` | Anonymized deliverable choice |
-| Reflect | `harness2:reflect` | Edit rows + at most one durable entry |
-| Adopt | `harness2_adopt` | Bank the harness + experience in the library |
+| Init | `harness2_init` | The task text and source files land in the run directory |
+| Reference | `harness2_probe` | The task runs under the unedited harness |
+| Propose | agent + `harness2_seed`, `harness2_check` | Two edited harnesses: one for how the agent works, one for what an expert in the field knows |
+| Probe | `harness2_probe` | Each edited harness runs the task in its own session |
+| Compose | agent + `harness2_check` | The agent merges the edits the trajectories support, or keeps the base |
+| Successor | `harness2_probe` | The merged harness runs the task |
+| Select (k>1) | agent + `harness2:select` | A choice between the anonymized deliverables |
+| Reflect | agent + `harness2:reflect` | One saved lesson per changed component, or none |
+| Adopt | `harness2_adopt` | The harness and the lesson enter the library |
 
-The stage prompts ship verbatim from the paper's appendix in
-`assets/prompts/`; the bundled skills are thin protocols that point at them.
+A basic round (k=1) runs 4 probe sessions: 1 reference + 2 candidates + 1
+successor. That is 4 full agent sessions plus the agent's own stage work.
+Each probe has a wall-clock cap (default 900 s). You set the cap with
+`probe_budget_seconds`, in Desktop Settings → Plugins or under
+`plugins.entries.harness2.settings` in `config.yaml`. A full round takes
+minutes to hours, depending on the task and k. When k is greater than 1,
+the Reference stage runs k rollouts, and the Select stage chooses between
+the anonymized deliverables.
 
-## Cost
+## Safety
 
-k=1: 1 reference + 2 candidate + 1 successor = 4 full agent sessions, plus
-the host session's stage work. Every probe is capped by
-`probe_budget_seconds` (default 900 s, set in Desktop Settings → Plugins or
-`plugins.entries.harness2.settings` in config.yaml).
+- A probe is a one-shot session in a profile named
+  `harness2-<task>-<probe>`. The profile clones your active profile, so the
+  probe runs under your model and your keys.
+- The probe overlay pins `approvals.mode: smart` and
+  `security.redact_secrets: true`. The plugin never relaxes approvals.
+- For a task you want to run offline, remove the `web` and `browser`
+  toolsets from the `config.yaml` in the candidate tree before you probe
+  it.
+- Keep grading material (rubrics, answer keys, scores) out of the task text
+  and the source files. The loop's prompts forbid it.
+- The plugin writes only to its data directory and to the probe profiles.
+  It never writes to its own files. `harness2_gc` removes probe profiles
+  and finished runs. It never touches the library.
+- The plugin makes no network calls and sends no telemetry. A probe does
+  whatever its tools do.
 
-## Safety and isolation
+## Where things live
 
-- Probes run as one-shot sessions in `harness2-*` profiles cloned from the
-  active profile. The probe overlay pins `approvals.mode: smart` and
-  `security.redact_secrets: true`; the plugin never relaxes approvals.
-- The installed plugin tree is read-only. All run state (runs, candidates,
-  library) lives in the plugin data directory under the active profile and
-  survives plugin updates; `harness2_gc` removes probe profiles and
-  finished runs.
-- The paper's guard is preserved: task.md and source/ must never contain
-  grading material, and the reflector treats trajectories as data, not
-  instructions.
-- Probe profiles inherit the active profile's model wiring and full tool
-  access (including web), like any profile. For benchmark-style tasks,
-  restrict the `web`/`browser` toolsets in the base overlay
-  (`assets/base/config.yaml` in the candidate trees you seed) if you want
-  probes offline.
+```
+harness2-hermes/
+├── plugin.yaml                 # manifest: tools, settings, version floor
+├── __init__.py                 # register(ctx): tools + bundled skills
+├── core.py                     # trees, profiles, probes, gate, library
+├── schemas.py                  # tool descriptions the model reads
+├── tools.py                    # tool handlers
+├── assets/
+│   ├── base/                   # the unedited harness (SOUL.md, config, skills)
+│   └── prompts/                # the paper's stage prompts, verbatim
+├── skills/                     # run, propose, compose, select, reflect
+└── docs/shots/                 # screenshots from a real run
+```
 
-## Disclosure
+Run state is outside the repo, in the plugin data directory under the
+active profile. It survives plugin updates:
 
-- Spawns `hermes profile create --clone` and one-shot
-  `hermes -p harness2-<task>-<probe> chat` subprocesses; each probe is a
-  full agent session billed to your configured model, wall-clock capped.
-- Creates and refreshes Hermes profiles named `harness2-*` (deleted via
-  `harness2_gc`); a probe profile's config is the active profile's config
-  deep-merged with the harness tree's overlay, and its `.env` is the
-  active profile's, so probes run under your own model wiring.
-- Reads and writes only its plugin data directory and the probe profile
-  directories. No telemetry, no third-party network calls of its own;
-  probes make whatever calls their tools make.
-- Long-running work: a full round takes minutes to hours depending on task
-  and k; probes run to completion or their wall-clock budget.
+```
+<plugin-data>/harness2/
+├── runs/<task>/                # task.md, source/, per-probe trajectories + deliverables
+├── candidates/<task>-<id>/     # edited harness trees + .meta.json provenance
+└── library/                    # entries/<task>/harness + EXPERIENCE.md, INDEX.md
+```
 
-## State
+The probe profiles live in `~/.hermes/profiles/harness2-*/`.
+`harness2_status` prints the exact paths.
 
-| Where | What |
-|---|---|
-| plugin data dir `runs/<task>/` | task.md, source/, per-probe `stdout.log` (trajectory) + `ws/out/` deliverables, reflection.md |
-| plugin data dir `candidates/<task>-<id>/` | candidate harness trees + `.meta.json` provenance |
-| plugin data dir `library/` | `entries/<task>/harness/` + `EXPERIENCE.md`, `INDEX.md` |
-| `~/.hermes/profiles/harness2-*/` | probe profiles (clone + overlay) |
+## Validation
 
-Find the exact paths with `harness2_status`.
-
-## Development
-
-```bash
+```sh
 hermes plugins doctor /path/to/harness2-hermes --ci
 hermes plugins validate /path/to/harness2-hermes --install-deps
 ```
 
-Apache-2.0. Not affiliated with Google Research; the loop follows
-[arXiv:2610.14224](https://arxiv.org/abs/2610.14224)
-([google-research/harness2](https://github.com/google-research/harness2)).
+These run the same checks the catalog CI runs: the manifest, the load, the
+capability match, the security scan, and the desktop rules. CI runs them at
+the pinned commit.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE). Not affiliated with Google Research.
