@@ -1,0 +1,609 @@
+"""Harness^2 core: harness trees, probe profiles, probe runs, library.
+
+Mechanical half of the loop. The LLM half (editor, composer, selector,
+reflector) runs in the host agent's own session, guided by the plugin's
+bundled skills; this module is deterministic and side-effect limited to:
+
+- the plugin data directory (runs/, candidates/, library/), which survives
+  plugin updates and follows the active profile;
+- Hermes probe profiles named harness2-* (created by the standard
+  ``hermes profile create --clone`` mechanism, refreshed on each probe);
+- spawning ``hermes -p <probe-profile> chat`` one-shot sessions (the probes).
+
+The installed plugin tree itself is never written to.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import yaml
+
+PLUGIN_NAME = "harness2"
+KEEP_BASE = "KEEP_BASE"
+MAX_CONTEXT_CHARS = 20_000
+PROBE_GRACE_SECONDS = 180  # startup + teardown headroom on top of the run budget
+
+TASK_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+
+
+class H2Error(ValueError):
+    """User-facing error; the message is safe to return to the model."""
+
+
+# ---------------------------------------------------------------------------
+# Roots and executables
+
+
+def data_root() -> Path:
+    """Plugin-owned state root (profile-scoped, survives updates)."""
+    from plugins.plugin_storage import plugin_data_dir
+
+    root = Path(plugin_data_dir(PLUGIN_NAME))
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def assets_dir() -> Path:
+    return Path(__file__).resolve().parent / "assets"
+
+
+def base_tree() -> Path:
+    p = assets_dir() / "base"
+    if not (p / "SOUL.md").exists():
+        raise H2Error("base harness asset missing (assets/base/SOUL.md); install is incomplete")
+    return p
+
+
+def prompts_dir() -> Path:
+    p = assets_dir() / "prompts"
+    if not p.is_dir():
+        raise H2Error("stage prompts asset missing (assets/prompts/); install is incomplete")
+    return p
+
+
+def runs_dir() -> Path:
+    d = data_root() / "runs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def candidates_dir() -> Path:
+    d = data_root() / "candidates"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+
+
+def _hermes_exe() -> str:
+    exe = shutil.which("hermes")
+    if exe:
+        return exe
+    cand = Path(sys.executable).resolve().parent / "hermes"
+    if cand.exists():
+        return str(cand)
+    raise H2Error("hermes executable not found on PATH; probes cannot run")
+
+
+def _run_hermes(args, timeout: int) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [_hermes_exe()] + list(args),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def deep_merge(base: dict, overlay: dict) -> dict:
+    """Overlay wins; dicts merge recursively (probe overlay semantics)."""
+    out = dict(base)
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Tasks and candidate trees
+
+
+def task_dir(task: str) -> Path:
+    if not TASK_RE.match(task or ""):
+        raise H2Error(f"invalid task slug {task!r}: use lowercase [a-z0-9-], 1-64 chars")
+    return runs_dir() / task
+
+
+def init_task(task: str, task_text: str, source_dir: str | None = None) -> dict:
+    d = task_dir(task)
+    if (d / "task.md").exists():
+        raise H2Error(f"task already initialized: {d / 'task.md'} exists; pick another slug")
+    text = (task_text or "").strip()
+    if not text:
+        raise H2Error("task_text is empty")
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "task.md").write_text(text + "\n")
+    if source_dir:
+        src = Path(source_dir).expanduser()
+        if not src.is_dir():
+            raise H2Error(f"source_dir not found: {src}")
+        dst = d / "source"
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+    (d / ".meta.json").write_text(
+        json.dumps({"task": task, "created": int(time.time())}, indent=2) + "\n"
+    )
+    return {
+        "task": task,
+        "task_dir": str(d),
+        "source_files": sorted(p.relative_to(d).as_posix() for p in (d / "source").rglob("*") if p.is_file())
+        if (d / "source").is_dir()
+        else [],
+    }
+
+
+def candidate_dir(task: str, cid: str) -> Path:
+    if not TASK_RE.match(task or ""):
+        raise H2Error(f"invalid task slug {task!r}")
+    if not ID_RE.match(cid or ""):
+        raise H2Error(f"invalid candidate id {cid!r}: use lowercase [a-z0-9-], 1-32 chars")
+    return candidates_dir() / f"{task}-{cid}"
+
+
+def resolve_tree(task: str, ref: str) -> Path:
+    """Resolve 'base' | 'candidate:<id>' | 'library:<entry>' to a tree path."""
+    ref = (ref or "").strip()
+    if ref == "base":
+        return base_tree()
+    if ref.startswith("candidate:"):
+        p = candidates_dir() / f"{task}-{ref.split(':', 1)[1]}"
+    elif ref.startswith("library:"):
+        p = data_root() / "library" / "entries" / ref.split(":", 1)[1] / "harness"
+    else:
+        raise H2Error("tree must be 'base', 'candidate:<id>' or 'library:<entry>'")
+    if not (p / "SOUL.md").exists():
+        raise H2Error(f"tree not found or has no SOUL.md: {p}")
+    return p
+
+
+def seed_candidate(task: str, cid: str, from_ref: str = "base", note: str = "") -> dict:
+    dst = candidate_dir(task, cid)
+    if dst.exists():
+        raise H2Error(f"{dst.name} already exists; pick another id or delete it first")
+    src = resolve_tree(task, from_ref)
+    shutil.copytree(src, dst)
+    (dst / ".meta.json").write_text(
+        json.dumps({"task": task, "id": cid, "from": from_ref, "note": note}, indent=2) + "\n"
+    )
+    return {"candidate": str(dst), "name": dst.name, "from": from_ref}
+
+
+# ---------------------------------------------------------------------------
+# Probe profiles and probe runs
+
+
+def profile_name(task: str, probe_id: str) -> str:
+    name = f"harness2-{task}-{probe_id}".lower()
+    return re.sub(r"-{2,}", "-", name).strip("-")
+
+
+def materialize_profile(tree: Path, profile: str, budget: int) -> Path:
+    """Create-once / refresh-on-use materialization of a tree as a profile.
+
+    First use: ``hermes profile create --clone <name>`` (inherits the active
+    profile's model wiring). Every use: deep-merge the tree's config overlay
+    over the active profile config, pin the run budget, replace SOUL.md and
+    skills/ with the tree's.
+    """
+    home = _hermes_home()
+    dst = home / "profiles" / profile
+    if not dst.exists():
+        r = _run_hermes(["profile", "create", "--clone", profile], timeout=300)
+        if r.returncode != 0 or not dst.exists():
+            raise H2Error(
+                f"hermes profile create --clone {profile} failed: "
+                f"{(r.stderr or r.stdout).strip()[:500]}"
+            )
+
+    active_cfg = home / "config.yaml"
+    active = yaml.safe_load(active_cfg.read_text()) if active_cfg.exists() else None
+    active = active if isinstance(active, dict) else {}
+    overlay_path = tree / "config.yaml"
+    overlay = yaml.safe_load(overlay_path.read_text()) if overlay_path.exists() else None
+    overlay = overlay if isinstance(overlay, dict) else {}
+
+    merged = deep_merge(active, overlay)
+    agent = merged.setdefault("agent", {})
+    if not isinstance(agent, dict):
+        merged["agent"] = agent = {}
+    agent["run_budget_seconds"] = int(budget)
+    (dst / "config.yaml").write_text(yaml.safe_dump(merged, sort_keys=False))
+
+    env_src = home / ".env"
+    if env_src.exists():
+        shutil.copy2(env_src, dst / ".env")
+    soul = tree / "SOUL.md"
+    if soul.exists():
+        shutil.copy2(soul, dst / "SOUL.md")
+
+    skills_dst = dst / "skills"
+    if skills_dst.exists():
+        shutil.rmtree(skills_dst)
+    skills_src = tree / "skills"
+    skills = []
+    if skills_src.is_dir():
+        shutil.copytree(skills_src, skills_dst)
+        skills = sorted(p.name for p in skills_dst.iterdir())
+    return dst
+
+
+def _final_reply(log: Path, limit: int = 400) -> str:
+    text = ""
+    if log.exists():
+        for line in log.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "result":
+                text = ev.get("text") or ""
+    return text.strip()[:limit]
+
+
+def _deliverables(ws: Path) -> list[str]:
+    out = ws / "out"
+    if not out.is_dir():
+        return []
+    return sorted(p.relative_to(ws).as_posix() for p in out.rglob("*") if p.is_file())
+
+
+def run_probe(task: str, tree_ref: str, probe_id: str, budget: int, source_tag: str) -> dict:
+    """Materialize the tree as a profile and run one budgeted one-shot session."""
+    if not ID_RE.match(probe_id or ""):
+        raise H2Error(f"invalid probe id {probe_id!r}: use lowercase [a-z0-9-], 1-32 chars")
+    tree = resolve_tree(task, tree_ref)
+    tdir = task_dir(task)
+    if not (tdir / "task.md").exists():
+        raise H2Error(f"task not initialized: missing {tdir / 'task.md'} (call harness2_init)")
+
+    profile = profile_name(task, probe_id)
+    materialize_profile(tree, profile, budget)
+
+    probe_dir = tdir / probe_id
+    ws = probe_dir / "ws"
+    if ws.exists():
+        shutil.rmtree(ws)
+    (ws / "out").mkdir(parents=True)
+    shutil.copy2(tdir / "task.md", ws / "task.md")
+    if (tdir / "source").is_dir():
+        shutil.copytree(tdir / "source", ws / "source")
+    if (tree / "hermes.md").exists():
+        shutil.copy2(tree / "hermes.md", ws / ".hermes.md")
+    if (tree / "scripts").is_dir():
+        shutil.copytree(tree / "scripts", ws / "scripts")
+    skills_root = tree / "skills"
+    if skills_root.is_dir():
+        for d in skills_root.glob("*/scripts"):
+            if d.is_dir():
+                (ws / "scripts").mkdir(exist_ok=True)
+                for f in d.iterdir():
+                    if f.is_file():
+                        shutil.copy2(f, ws / "scripts" / f.name)
+
+    log = probe_dir / "stdout.log"
+    cmd = [
+        _hermes_exe(), "-p", profile, "chat",
+        "--in", str(ws),
+        "--query-file", str(ws / "task.md"),
+        "--format", "stream-json",
+        "--source", source_tag or "tool",
+    ]
+    started = time.time()
+    exit_code = 0
+    timed_out = False
+    try:
+        with open(log, "wb") as out:
+            subprocess.run(
+                cmd, stdout=out, stderr=subprocess.STDOUT,
+                timeout=int(budget) + PROBE_GRACE_SECONDS,
+            )
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        exit_code = -1
+    duration = round(time.time() - started, 1)
+
+    prof_sessions = _hermes_home() / "profiles" / profile / "sessions"
+    if prof_sessions.is_dir():
+        newest = sorted(prof_sessions.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if newest:
+            shutil.copy2(newest[0], probe_dir / "transcript.jsonl")
+
+    return {
+        "probe": probe_id,
+        "profile": profile,
+        "tree": tree_ref,
+        "probe_dir": str(probe_dir),
+        "workspace": str(ws),
+        "trajectory": str(log),
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "duration_s": duration,
+        "deliverables": _deliverables(ws),
+        "final_reply": _final_reply(log),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Validation gate
+
+
+def parse_frontmatter(text: str):
+    m = re.match(r"^---\n(.*?)\n---\n", text, re.S)
+    if not m:
+        return None
+    try:
+        return yaml.safe_load(m.group(1))
+    except yaml.YAMLError:
+        return None
+
+
+def check_tree(tree: Path) -> list[str]:
+    """Structural gate: YAML parses, skill names/trigger lines/scripts resolve,
+    context files under the size cap. Judgment rules are the editor's job."""
+    errors: list[str] = []
+    cfg = tree / "config.yaml"
+    if cfg.exists():
+        try:
+            yaml.safe_load(cfg.read_text())
+        except yaml.YAMLError as e:
+            errors.append(f"config.yaml: invalid YAML: {e}")
+
+    soul_p, hermes_p = tree / "SOUL.md", tree / "hermes.md"
+    always_on = (
+        (soul_p.read_text() if soul_p.exists() else "")
+        + "\n"
+        + (hermes_p.read_text() if hermes_p.exists() else "")
+    )
+
+    skills_root = tree / "skills"
+    if skills_root.is_dir():
+        for skill_md in sorted(skills_root.glob("*/SKILL.md")):
+            name = skill_md.parent.name
+            fm = parse_frontmatter(skill_md.read_text())
+            if fm is None:
+                errors.append(f"skills/{name}: SKILL.md frontmatter missing or invalid YAML")
+                continue
+            if fm.get("name") != name:
+                errors.append(
+                    f"skills/{name}: frontmatter name {fm.get('name')!r} != directory name"
+                )
+            if not re.search(rf"\b{re.escape(name)}\b", always_on):
+                errors.append(f"skills/{name}: no trigger line in SOUL.md or hermes.md")
+            for m in re.finditer(r"scripts/([\w.\-]+)", skill_md.read_text()):
+                if not (skills_root / name / "scripts" / m.group(1)).exists():
+                    errors.append(f"skills/{name}: names missing script scripts/{m.group(1)}")
+
+    for p in (soul_p, hermes_p):
+        if p.exists() and len(p.read_text()) > MAX_CONTEXT_CHARS:
+            errors.append(f"{p.name}: {len(p.read_text())} chars, over the 20k cap")
+    return errors
+
+
+def check_candidate(task: str, cid: str) -> dict:
+    tree = candidate_dir(task, cid)
+    if not tree.is_dir():
+        raise H2Error(f"candidate not found: {tree}")
+    errors = check_tree(tree)
+    return {"candidate": tree.name, "ok": not errors, "errors": errors}
+
+
+def diff_trees(base: Path, other: Path) -> list[str]:
+    """File-level diff between two harness trees (added/removed/changed)."""
+
+    def files(t: Path) -> dict[str, Path]:
+        return {
+            p.relative_to(t).as_posix(): p
+            for p in t.rglob("*")
+            if p.is_file() and p.name != ".meta.json"
+        }
+
+    fa, fb = files(base), files(other)
+    out = []
+    for name in sorted(set(fa) | set(fb)):
+        if name not in fb:
+            out.append(f"removed  {name}")
+        elif name not in fa:
+            out.append(f"added    {name}")
+        elif fa[name].read_bytes() != fb[name].read_bytes():
+            out.append(f"changed  {name}")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Improvement library
+
+
+def library_entries_dir() -> Path:
+    d = data_root() / "library" / "entries"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _regen_library_index() -> Path:
+    entries = library_entries_dir()
+    rows = [
+        "# Improvement library index",
+        "",
+        "One row per entry. A future Propose/Probe/Compose session reads the index",
+        "first and inspects an entry's harness/ and EXPERIENCE.md on demand.",
+        "",
+    ]
+    for d in sorted(entries.iterdir()):
+        if d.name.startswith("_") or not d.is_dir():
+            continue
+        cue = ""
+        exp = d / "EXPERIENCE.md"
+        if exp.exists():
+            for line in exp.read_text(errors="replace").splitlines():
+                if line.lower().startswith("cue:"):
+                    cue = line.split(":", 1)[1].strip()
+                    break
+        if not cue:
+            cue = "(see EXPERIENCE.md)"
+        rows.append(f"- {d.name}/  |  {cue}")
+    idx = entries.parent / "INDEX.md"
+    idx.write_text("\n".join(rows) + "\n")
+    return idx
+
+
+def adopt(
+    task: str,
+    adopted_ref: str,
+    experience_path: str | None = None,
+    no_entry: bool = False,
+) -> dict:
+    """Bank an adopted harness (or KEEP_BASE) plus the reflector's experience."""
+    entry = library_entries_dir() / task_dir(task).name
+    if entry.exists():
+        raise H2Error(f"library entry already exists for task {task!r}")
+    entry.mkdir(parents=True)
+    if adopted_ref == KEEP_BASE:
+        pass
+    else:
+        if not adopted_ref.startswith("candidate:"):
+            raise H2Error("adopted must be 'KEEP_BASE' or 'candidate:<id>'")
+        tree = resolve_tree(task, adopted_ref)
+        shutil.copytree(tree, entry / "harness")
+        meta = entry / "harness" / ".meta.json"
+        if meta.exists():
+            meta.unlink()
+    if no_entry:
+        (entry / "EXPERIENCE.md").write_text(f"# Experience: {task}\n\nNO_ENTRY\n")
+    else:
+        if not experience_path:
+            raise H2Error("experience_path (the reflection file) is required unless no_entry is set")
+        p = Path(experience_path).expanduser()
+        if not p.exists():
+            raise H2Error(f"experience file not found: {p}")
+        m = re.search(r"<experience>\n(.*?)\n</experience>", p.read_text(errors="replace"), re.S)
+        if not m:
+            raise H2Error("no <experience> block found in the reflection file")
+        (entry / "EXPERIENCE.md").write_text(f"# Experience: {task}\n\n{m.group(1).strip()}\n")
+    idx = _regen_library_index()
+    return {"entry": str(entry), "index": str(idx)}
+
+
+def library_list() -> dict:
+    entries = library_entries_dir()
+    rows = []
+    for d in sorted(entries.iterdir()):
+        if d.name.startswith("_") or not d.is_dir():
+            continue
+        exp = d / "EXPERIENCE.md"
+        cue = ""
+        if exp.exists():
+            for line in exp.read_text(errors="replace").splitlines():
+                if line.lower().startswith("cue:"):
+                    cue = line.split(":", 1)[1].strip()
+                    break
+        rows.append(
+            {
+                "entry": d.name,
+                "has_harness": (d / "harness").is_dir(),
+                "experience": str(exp) if exp.exists() else None,
+                "cue": cue,
+            }
+        )
+    return {"entries": rows, "index": str(entries.parent / "INDEX.md")}
+
+
+def library_show(task: str) -> dict:
+    entry = library_entries_dir() / task_dir(task).name
+    if not entry.is_dir():
+        raise H2Error(f"no library entry for task {task!r}")
+    exp = entry / "EXPERIENCE.md"
+    harness = entry / "harness"
+    return {
+        "entry": str(entry),
+        "experience": exp.read_text(errors="replace") if exp.exists() else None,
+        "harness": str(harness) if harness.is_dir() else None,
+        "harness_files": sorted(p.relative_to(harness).as_posix() for p in harness.rglob("*") if p.is_file())
+        if harness.is_dir()
+        else [],
+        "diff_vs_base": diff_trees(base_tree(), harness) if harness.is_dir() else [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Status and garbage collection
+
+
+def status(task: str) -> dict:
+    d = task_dir(task)
+    base = {
+        "task": task,
+        "data_root": str(data_root()),
+        "base_tree": str(base_tree()),
+        "prompts_dir": str(prompts_dir()),
+    }
+    if not d.exists():
+        return {**base, "exists": False}
+    probes = {}
+    for p in sorted(d.iterdir()):
+        if p.is_dir() and (p / "stdout.log").exists():
+            probes[p.name] = {
+                "deliverables": _deliverables(p / "ws"),
+                "trajectory_bytes": (p / "stdout.log").stat().st_size,
+            }
+    cdir = candidates_dir()
+    candidates = [
+        f.name for f in sorted(cdir.iterdir()) if f.is_dir() and f.name.startswith(task + "-")
+    ] if cdir.is_dir() else []
+    return {
+        **base,
+        "exists": True,
+        "task_dir": str(d),
+        "task_md": (d / "task.md").exists(),
+        "has_source": (d / "source").is_dir(),
+        "probes": probes,
+        "candidates": candidates,
+        "reflection": (d / "reflection.md").exists(),
+        "in_library": (library_entries_dir() / task).is_dir(),
+    }
+
+
+def gc(task: str | None = None, drop_profiles: bool = True, drop_runs: bool = False) -> dict:
+    removed_profiles: list[str] = []
+    removed_runs: list[str] = []
+    if drop_profiles:
+        home = _hermes_home() / "profiles"
+        prefix = f"harness2-{task}-" if task else "harness2-"
+        if home.is_dir():
+            for p in sorted(home.iterdir()):
+                if p.is_dir() and p.name.startswith(prefix):
+                    r = _run_hermes(["profile", "delete", "-y", p.name], timeout=120)
+                    if r.returncode == 0 and not (home / p.name).exists():
+                        removed_profiles.append(p.name)
+    if drop_runs:
+        if not task:
+            raise H2Error("drop_runs requires a task slug")
+        d = task_dir(task)
+        if d.exists():
+            shutil.rmtree(d)
+            removed_runs.append(d.name)
+    return {"removed_profiles": removed_profiles, "removed_runs": removed_runs}

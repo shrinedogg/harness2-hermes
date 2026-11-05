@@ -1,0 +1,33 @@
+name: harness2
+version: 1.0.0
+manifest_version: 2
+license: Apache-2.0
+homepage: https://github.com/shrinedogg/harness2-hermes
+description: >-
+  The Harness^2 self-improvement loop for Hermes profiles: refine this agent's
+  harness (system prompt + config + skills) for a class of work with a
+  contrastive propose-probe-compose cycle over isolated budgeted probe
+  sessions, and bank evidence-backed lessons in a per-profile improvement
+  library that future tasks read before editing.
+tags: [self-improvement, meta-agent, automation, harness2]
+requires_hermes: ">=0.22.0"
+provides_tools:
+  - harness2_init
+  - harness2_probe
+  - harness2_seed
+  - harness2_check
+  - harness2_adopt
+  - harness2_library
+  - harness2_status
+  - harness2_gc
+config_schema:
+  probe_budget_seconds:
+    type: int
+    default: 900
+    label: Probe wall-clock budget
+    description: Run ceiling in seconds for each one-shot probe session (agent.run_budget_seconds in the probe profile).
+  probe_source_tag:
+    type: str
+    default: tool
+    label: Probe session source tag
+    description: Session source tag for probe runs; 'tool' keeps them out of the normal session lists.
