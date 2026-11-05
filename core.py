@@ -14,6 +14,7 @@ The installed plugin tree itself is never written to.
 """
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -412,8 +413,8 @@ def check_candidate(task: str, cid: str) -> dict:
     return {"candidate": tree.name, "ok": not errors, "errors": errors}
 
 
-def diff_trees(base: Path, other: Path) -> list[str]:
-    """File-level diff between two harness trees (added/removed/changed)."""
+def diff_tree_files(base: Path, other: Path) -> dict[str, str]:
+    """File-level diff between two harness trees: name -> added/removed/changed."""
 
     def files(t: Path) -> dict[str, Path]:
         return {
@@ -423,15 +424,30 @@ def diff_trees(base: Path, other: Path) -> list[str]:
         }
 
     fa, fb = files(base), files(other)
-    out = []
-    for name in sorted(set(fa) | set(fb)):
+    out: dict[str, str] = {}
+    for name in set(fa) | set(fb):
         if name not in fb:
-            out.append(f"removed  {name}")
+            out[name] = "removed"
         elif name not in fa:
-            out.append(f"added    {name}")
+            out[name] = "added"
         elif fa[name].read_bytes() != fb[name].read_bytes():
-            out.append(f"changed  {name}")
+            out[name] = "changed"
     return out
+
+
+_LABEL = {"added": "added    ", "removed": "removed  ", "changed": "changed  "}
+
+
+def diff_trees(base: Path, other: Path) -> list[str]:
+    """File-level diff between two harness trees (added/removed/changed)."""
+    return [_LABEL[s] + n for n, s in sorted(diff_tree_files(base, other).items())]
+
+
+def _diff_text(a: str, b: str, label_a: str, label_b: str) -> str:
+    out = difflib.unified_diff(
+        a.splitlines(), b.splitlines(), fromfile=label_a, tofile=label_b, n=3, lineterm=""
+    )
+    return "\n".join(out) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +498,9 @@ def adopt(
     if entry.exists():
         raise H2Error(f"library entry already exists for task {task!r}")
     entry.mkdir(parents=True)
+    (entry / ".meta.json").write_text(
+        json.dumps({"task": task, "adopted": adopted_ref, "no_entry": no_entry, "ts": int(time.time())}, indent=2) + "\n"
+    )
     if adopted_ref == KEEP_BASE:
         pass
     else:
@@ -546,6 +565,209 @@ def library_show(task: str) -> dict:
         if harness.is_dir()
         else [],
         "diff_vs_base": diff_trees(base_tree(), harness) if harness.is_dir() else [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Promotion: carrying a banked round's changes toward the live profile
+
+
+def live_profile_dir() -> Path:
+    """Home of the active profile (where SOUL.md, skills/ and config.yaml live)."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home()
+    except Exception:  # noqa: BLE001 - fallback for tests and direct use
+        return _hermes_home()
+
+
+def _classify_file(name: str) -> str:
+    if name == "config.yaml":
+        return "overlay"
+    if name in ("SOUL.md", "hermes.md"):
+        return "notes"
+    if name.startswith("skills/"):
+        return "skill"
+    if name.startswith("scripts/"):
+        return "scripts"
+    return "other"
+
+
+def _parse_edit_rows(reflection_text: str) -> list[dict]:
+    """Parse the reflector's <edits> block into 5-field rows (lenient)."""
+    m = re.search(r"<edits>\n(.*?)\n</edits>", reflection_text, re.S)
+    if not m:
+        return []
+    rows: list[dict] = []
+    cur: dict | None = None
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        key, _, val = line.partition(":")
+        key = key.strip().lower()
+        if key == "component":
+            if cur:
+                rows.append(cur)
+            cur = {"component": val.strip(), "candidates": "", "change": "", "observed": "", "verdict": ""}
+        elif cur is not None and key in cur:
+            cur[key] = val.strip()
+    if cur:
+        rows.append(cur)
+    return rows
+
+
+def _rows_for_file(rows: list[dict], name: str) -> list[dict]:
+    out = []
+    for r in rows:
+        c = r["component"]
+        if c == name or name.startswith(c + "/") or c.startswith(name + "/"):
+            out.append(r)
+        elif name == "config.yaml" and c.startswith("config.yaml"):
+            out.append(r)
+    return out
+
+
+def promote(task: str) -> dict:
+    """Carry-over report for an adopted round.
+
+    Diffs the banked harness against the unmodified base (what this round
+    actually changed), attaches the reflector's edit rows and experience, and
+    classifies each changed file for the live profile: skills install,
+    SOUL.md/hermes.md review (base text is probe scaffolding), config.yaml is
+    probe-only and never promoted. Writes runs/<task>/promote.md. This tool
+    never writes the live profile; applying changes is the user's step.
+    """
+    d = task_dir(task)
+    entry = library_entries_dir() / task
+    if not entry.is_dir():
+        raise H2Error(f"no library entry for task {task!r}; adopt the round first")
+    meta_p = entry / ".meta.json"
+    meta: dict = {}
+    if meta_p.exists():
+        try:
+            meta = json.loads(meta_p.read_text())
+        except json.JSONDecodeError:
+            meta = {}
+    harness = entry / "harness"
+    tree = harness if (harness / "SOUL.md").exists() else None
+    base = base_tree()
+    profile = live_profile_dir()
+
+    changed = diff_tree_files(base, tree) if tree is not None else {}
+    reflection = d / "reflection.md"
+    rows = _parse_edit_rows(reflection.read_text(errors="replace")) if reflection.exists() else []
+
+    files: list[dict] = []
+    for name in sorted(changed):
+        st = changed[name]
+        kind = _classify_file(name)
+        matched = _rows_for_file(rows, name)
+        verdicts = sorted({r["verdict"] for r in matched if r["verdict"]})
+        if kind == "skill":
+            if st == "removed":
+                rec = "no action: base probe scaffolding removed from the tree; live profile unaffected"
+            else:
+                top = name.split("/", 2)
+                skill_name = top[1] if len(top) > 1 else name
+                rec = f"install: copy '{skill_name}' into the live profile's skills/ (tested under the tree)"
+        elif kind == "notes":
+            rec = "review: base text is probe scaffolding; carry over only the lesson text you judge transferable"
+        elif kind == "overlay":
+            rec = "do not promote: probe-only overlay (run budget, approvals mode, secret redaction)"
+        elif kind == "scripts":
+            rec = "review: probe workspace script; promote as part of a skill only if it is generic"
+        else:
+            rec = "review"
+        files.append({"file": name, "status": st, "kind": kind, "verdict": " / ".join(verdicts), "rec": rec})
+
+    # Report
+    md: list[str] = []
+    md.append(f"# Promote report: {task}")
+    md.append("")
+    md.append(f"Generated: {time.strftime('%Y-%m-%d %H:%M %Z')}")
+    md.append(f"Adopted: {meta.get('adopted', 'unknown (meta missing)')}")
+    md.append(f"Banked tree: {str(tree) if tree else 'none (KEEP_BASE round)'}")
+    md.append(f"Base tree: {base}")
+    md.append(f"Live profile: {profile}")
+    md.append("")
+    if not changed:
+        md.append("This round kept the base harness. There are no tree changes to carry over;")
+        md.append("only the experience below is worth reviewing.")
+        md.append("")
+    else:
+        md.append("## What this round changed (banked tree vs base)")
+        for f in files:
+            name, st = f["file"], f["status"]
+            md.append("")
+            md.append(f"### {name} -- {st}")
+            if f["verdict"]:
+                md.append(f"verdict: {f['verdict']}")
+            md.append(f"recommendation: {f['rec']}")
+            a = (base / name).read_text(errors="replace") if (base / name).exists() else ""
+            b = (tree / name).read_text(errors="replace") if tree and (tree / name).exists() else ""
+            if st == "removed":
+                diff = _diff_text(a, "", name, "/dev/null")
+            elif st == "added":
+                diff = _diff_text("", b, "/dev/null", name)
+            else:
+                diff = _diff_text(a, b, f"base/{name}", f"tree/{name}")
+            md.append("```diff")
+            md.append(diff.rstrip("\n"))
+            md.append("```")
+    md.append("")
+    md.append("## Evidence")
+    md.append("")
+    if reflection.exists():
+        m = re.search(r"<edits>\n.*?\n</edits>", reflection.read_text(errors="replace"), re.S)
+        md.append("Edit rows (reflection.md):")
+        md.append("")
+        md.append(m.group(0) if m else "(no <edits> block found)")
+        md.append("")
+    exp = entry / "EXPERIENCE.md"
+    if exp.exists():
+        md.append("Experience (library entry):")
+        md.append("")
+        md.append(exp.read_text(errors="replace").strip())
+        md.append("")
+    md.append("## Carry-over plan (live profile)")
+    md.append("")
+    md.append("The plugin never writes the live profile. Apply what you approve:")
+    md.append("")
+    if files:
+        for f in files:
+            md.append(f"- [ ] {f['file']} -- {f['rec']}" + (f" (verdict: {f['verdict']})" if f["verdict"] else ""))
+        cmds = [f for f in files if f["kind"] == "skill" and f["status"] != "removed"]
+        if cmds and tree is not None:
+            md.append("")
+            md.append("Skill install commands:")
+            for f in cmds:
+                top = f["file"].split("/", 2)
+                skill_name = top[1] if len(top) > 1 else top[0]
+                md.append(f"  cp -R {tree / 'skills' / skill_name} {profile / 'skills' / skill_name}")
+    else:
+        md.append("- Nothing to carry over (KEEP_BASE round).")
+    md.append("")
+
+    report = d / "promote.md"
+    report.write_text("\n".join(md) + "\n")
+    install = [
+        (f["file"].split("/", 2)[1] if f["file"].count("/") >= 1 else f["file"])
+        for f in files
+        if f["kind"] == "skill" and f["status"] != "removed"
+    ]
+    return {
+        "task": task,
+        "report": str(report),
+        "tree": str(tree) if tree else None,
+        "adopted": meta.get("adopted"),
+        "live_profile": str(profile),
+        "files": [
+            {"file": f["file"], "status": f["status"], "kind": f["kind"], "verdict": f["verdict"], "recommendation": f["rec"]}
+            for f in files
+        ],
+        "install": sorted(set(install)),
     }
 
 

@@ -89,6 +89,12 @@ def make_handlers(ctx):
         except Exception as e:
             return _err(e)
 
+    def promote(args: dict, **kwargs) -> str:
+        try:
+            return _ok(core.promote(args.get("task", "")))
+        except Exception as e:
+            return _err(e)
+
     def library(args: dict, **kwargs) -> str:
         try:
             action = args.get("action", "list")
@@ -122,6 +128,7 @@ def make_handlers(ctx):
         "seed": seed,
         "check": check,
         "adopt": adopt,
+        "promote": promote,
         "library": library,
         "status": status,
         "gc": gc,

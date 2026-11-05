@@ -136,6 +136,31 @@ ADOPT = {
     },
 }
 
+PROMOTE = {
+    "name": "harness2_promote",
+    "description": (
+        "After adopt: prepare the carry-over report for one task. Diffs the banked "
+        "harness against the unmodified base (what this round actually changed), "
+        "attaches the reflector's edit rows and the experience entry, and "
+        "classifies each changed file for the live profile: skills are "
+        "installable, SOUL.md/hermes.md changes are review (the base text is "
+        "probe scaffolding, only the lesson text transfers), config.yaml is "
+        "probe-only and never promoted. Writes runs/<task>/promote.md and "
+        "returns the plan. This tool never touches the live profile; hand the "
+        "report to the user and let them apply what they approve."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task": {
+                "type": "string",
+                "description": "Task slug (must have a library entry, i.e. the round is adopted).",
+            },
+        },
+        "required": ["task"],
+    },
+}
+
 LIBRARY = {
     "name": "harness2_library",
     "description": (

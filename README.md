@@ -16,7 +16,7 @@ harnesses and the saved lessons.
 
 The plugin has two parts:
 
-- **Tools that run the loop.** Eight `harness2_*` tools do the mechanical
+- **Tools that run the loop.** Nine `harness2_*` tools do the mechanical
   work. They start a run, clone a profile, and run budgeted test sessions.
   They capture each session's full trajectory, and they block broken edits
   with a structural gate. The code is deterministic Python.
@@ -87,6 +87,26 @@ lessons.
 | Select (k>1) | agent + `harness2:select` | A choice between the anonymized deliverables |
 | Reflect | agent + `harness2:reflect` | One saved lesson per changed component, or none |
 | Adopt | `harness2_adopt` | The harness and the lesson enter the library |
+| Promote | `harness2_promote` | A carry-over report: what the banked harness changed, with the evidence, ready for you to apply |
+
+### Carrying the changes to the live profile
+
+The loop works on a copy of the harness (the **base tree**), not on your
+live profile. After Adopt, `harness2_promote` writes
+`runs/<task>/promote.md`. The report shows every file the banked harness
+changed against the unedited base, the reflector's evidence for each change,
+and a recommendation per file:
+
+- **Skills** are installable: copy the skill directory into your profile's
+  `skills/`. The report includes the exact copy command.
+- **SOUL.md and hermes.md** changes are review: the base text is probe
+  scaffolding, so only the lesson text transfers, and only if you judge it
+  worth it.
+- **config.yaml** is never promoted: it is the probe overlay (run budget,
+  approvals mode, secret redaction) and must stay probe-only.
+
+The plugin never writes your live profile. You read the report, apply what
+you approve, and keep the rest.
 
 A basic round (k=1) runs 4 probe sessions: 1 reference + 2 candidates + 1
 successor. That is 4 full agent sessions plus the agent's own stage work.
@@ -110,8 +130,9 @@ the anonymized deliverables.
 - Keep grading material (rubrics, answer keys, scores) out of the task text
   and the source files. The loop's prompts forbid it.
 - The plugin writes only to its data directory and to the probe profiles.
-  It never writes to its own files. `harness2_gc` removes probe profiles
-  and finished runs. It never touches the library.
+  It never writes to its own files or to your live profile: the promote
+  report is your input, and applying it is your step. `harness2_gc` removes
+  probe profiles and finished runs. It never touches the library.
 - The plugin makes no network calls and sends no telemetry. A probe does
   whatever its tools do.
 
@@ -136,7 +157,8 @@ active profile. It survives plugin updates:
 
 ```
 <plugin-data>/harness2/
-├── runs/<task>/                # task.md, source/, per-probe trajectories + deliverables
+├── runs/<task>/                # task.md, source/, per-probe trajectories + deliverables,
+│                               # reflection.md, promote.md
 ├── candidates/<task>-<id>/     # edited harness trees + .meta.json provenance
 └── library/                    # entries/<task>/harness + EXPERIENCE.md, INDEX.md
 ```

@@ -17,6 +17,7 @@ provides_tools:
   - harness2_seed
   - harness2_check
   - harness2_adopt
+  - harness2_promote
   - harness2_library
   - harness2_status
   - harness2_gc

@@ -34,6 +34,7 @@ def register(ctx) -> None:
     ctx.register_tool(name="harness2_seed", toolset=_TOOLSET, schema=schemas.SEED, handler=h["seed"])
     ctx.register_tool(name="harness2_check", toolset=_TOOLSET, schema=schemas.CHECK, handler=h["check"])
     ctx.register_tool(name="harness2_adopt", toolset=_TOOLSET, schema=schemas.ADOPT, handler=h["adopt"])
+    ctx.register_tool(name="harness2_promote", toolset=_TOOLSET, schema=schemas.PROMOTE, handler=h["promote"])
     ctx.register_tool(name="harness2_library", toolset=_TOOLSET, schema=schemas.LIBRARY, handler=h["library"])
     ctx.register_tool(name="harness2_status", toolset=_TOOLSET, schema=schemas.STATUS, handler=h["status"])
     ctx.register_tool(name="harness2_gc", toolset=_TOOLSET, schema=schemas.GC, handler=h["gc"])

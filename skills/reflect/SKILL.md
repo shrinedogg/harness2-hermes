@@ -40,4 +40,7 @@ line in place of the `<experience>` block.
 ## Then
 
 `harness2_adopt` with the adopted tree (or `KEEP_BASE`) and
-`experience_path: runs/<task>/reflection.md` (or `no_entry: true`).
+`experience_path: runs/<task>/reflection.md` (or `no_entry: true`). Then
+`harness2_promote` for the task: it writes the carry-over report
+(`runs/<task>/promote.md`) classifying each change for the live profile.
+Hand that report to the user; the user decides what to apply.
