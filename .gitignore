@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+# Legacy scaffold run state from pre-plugin development (plugin run state
+# now lives in the plugin data directory, never in the repo)
+runs/
