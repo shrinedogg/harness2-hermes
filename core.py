@@ -200,6 +200,131 @@ def profile_name(task: str, probe_id: str) -> str:
     return re.sub(r"-{2,}", "-", name).strip("-")
 
 
+# ---------------------------------------------------------------------------
+# Gateway platform-credential isolation: a probe profile must never run the
+# gateway's adapters as a second consumer of the active profile's bot tokens
+# (the multiplexer would stamp a fatal duplicate_credential verdict per
+# platform and flip the desktop health pill, which ignores only
+# disabled/not_configured states).
+
+
+_ENV_LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+
+# Last-resort strip set, used only when the hermes source is not importable at
+# all: the six core token names of gateway/config.py::PLATFORM_TOKEN_ENV_NAMES.
+_CORE_PLATFORM_TOKENS = (
+    "TELEGRAM_BOT_TOKEN",
+    "DISCORD_BOT_TOKEN",
+    "SLACK_BOT_TOKEN",
+    "MATTERMOST_TOKEN",
+    "MATRIX_ACCESS_TOKEN",
+    "WEIXIN_TOKEN",
+)
+
+
+def _fallback_credential_keys() -> dict[str, str]:
+    """``{ENV_KEY: platform_id}`` from the hermes credential sources without the
+    full clone machinery (which also needs the plugin registry):
+    gateway/config.py::PLATFORM_TOKEN_ENV_NAMES plus
+    hermes_cli/profile_channels.py::credential_env_keys (core
+    _ENV_ENABLE_CREDENTIALS, plugin ENV_ENABLE_CREDENTIALS and EnvCred rows)."""
+    keys: dict[str, str] = {}
+    try:
+        from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+
+        for platform, name in PLATFORM_TOKEN_ENV_NAMES.items():
+            keys[name] = getattr(platform, "value", str(platform))
+    except Exception:  # noqa: BLE001 - a read failure just narrows the strip set
+        pass
+    try:
+        from hermes_cli.profile_channels import credential_env_keys
+
+        for key, pid in credential_env_keys().items():
+            keys.setdefault(key, str(pid))
+    except Exception:  # noqa: BLE001
+        pass
+    return keys
+
+
+def strip_platform_env(env_path: Path, source: Path) -> dict[str, list[str]]:
+    """Drop the gateway platform-adapter lines from a copied profile ``.env``.
+
+    Primary is hermes' own clone policy (``hermes_cli.profile_channels``): the
+    same ownership rules ``hermes profile create --clone`` applies so a second
+    profile can never consume the source's bot credentials - declared
+    credential keys, adapter policy/config keys and every ``<PLATFORM>_``
+    prefix (so MATRIX_ALLOWED_USERS and friends go with the tokens). Fallback
+    strips the declared credential set (exact key plus its platform prefix)
+    from the hermes sources. Either way comments, blank lines and every other
+    key (model keys, HERMES_CUSTOM_*, tool keys) survive verbatim. Returns
+    ``{platform: [keys removed]}``.
+    """
+    try:
+        from hermes_cli.profile_channels import ChannelKeyIndex, strip_channel_env_file
+
+        return strip_channel_env_file(env_path, ChannelKeyIndex(source))
+    except Exception:  # noqa: BLE001 - clone machinery unavailable: degrade
+        pass
+    keys = _fallback_credential_keys() or {
+        name: name.split("_", 1)[0].lower() for name in _CORE_PLATFORM_TOKENS
+    }
+    prefixes = sorted({name.split("_", 1)[0] + "_" for name in keys})
+    kept: list[str] = []
+    removed: dict[str, list[str]] = {}
+    text = env_path.read_text(encoding="utf-8-sig", errors="replace")
+    for line in text.splitlines():
+        m = _ENV_LINE_RE.match(line)
+        key = m.group(1) if m else None
+        owner = None
+        if key is not None and not key.startswith("HERMES_CUSTOM_"):
+            owner = keys.get(key) or next(
+                (p.rstrip("_").lower() for p in prefixes if key.startswith(p)), None
+            )
+        if key is None or owner is None:
+            kept.append(line)
+        else:
+            removed.setdefault(owner, []).append(key)
+    if removed:
+        env_path.write_text("\n".join(kept) + ("\n" if text.endswith("\n") or kept else ""), encoding="utf-8")
+    return removed
+
+
+def _platform_block_names(gateway: dict) -> list[str]:
+    """``gateway:`` keys that are platform shorthand blocks (``gateway.<platform>:``),
+    judged by hermes' own Platform enum when it is importable."""
+    try:
+        from gateway.config import Platform
+
+        names = {m.value for m in Platform.__members__.values() if m.value != "local"}
+    except Exception:  # noqa: BLE001 - degrade: skip the shorthand spelling
+        return []
+    return [k for k in gateway if k in names]
+
+
+def _disable_platforms(merged: dict) -> None:
+    """Set ``enabled: false`` for every platform the merged config has enabled, in
+    all three spellings the gateway loader reads (``platforms.<p>``,
+    ``gateway.platforms.<p>``, ``gateway.<p>``). The probe profile never runs
+    gateway adapters: an explicit disable beats env credentials at gateway
+    start, and the desktop health pill ignores disabled/not_configured states,
+    so no adapter starts and no duplicate_credential verdict can be stamped."""
+    def disable(section) -> None:
+        if not isinstance(section, dict):
+            return
+        for block in section.values():
+            if isinstance(block, dict) and block.get("enabled"):
+                block["enabled"] = False
+
+    disable(merged.get("platforms"))
+    gateway = merged.get("gateway")
+    if isinstance(gateway, dict):
+        disable(gateway.get("platforms"))
+        for key in _platform_block_names(gateway):
+            block = gateway.get(key)
+            if isinstance(block, dict) and block.get("enabled"):
+                block["enabled"] = False
+
+
 def materialize_profile(tree: Path, profile: str, budget: int) -> Path:
     """Create-once / refresh-on-use materialization of a tree as a profile.
 
@@ -207,6 +332,12 @@ def materialize_profile(tree: Path, profile: str, budget: int) -> Path:
     profile's model wiring). Every use: deep-merge the tree's config overlay
     over the active profile config, pin the run budget, replace SOUL.md and
     skills/ with the tree's.
+
+    The probe profile can never be a second consumer of the gateway's platform
+    credentials: the copied ``.env`` is stripped of the platform-adapter lines
+    (model keys and HERMES_CUSTOM_* survive byte-for-byte) and every platform
+    the merged config has enabled is set ``enabled: false``. Both steps run on
+    every materialization, not just the first.
     """
     home = _hermes_home()
     dst = home / "profiles" / profile
@@ -230,11 +361,14 @@ def materialize_profile(tree: Path, profile: str, budget: int) -> Path:
     if not isinstance(agent, dict):
         merged["agent"] = agent = {}
     agent["run_budget_seconds"] = int(budget)
+    _disable_platforms(merged)
     (dst / "config.yaml").write_text(yaml.safe_dump(merged, sort_keys=False))
 
     env_src = home / ".env"
     if env_src.exists():
-        shutil.copy2(env_src, dst / ".env")
+        env_dst = dst / ".env"
+        shutil.copy2(env_src, env_dst)
+        strip_platform_env(env_dst, home)
     soul = tree / "SOUL.md"
     if soul.exists():
         shutil.copy2(soul, dst / "SOUL.md")
