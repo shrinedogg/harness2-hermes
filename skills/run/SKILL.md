@@ -38,8 +38,12 @@ do the machinery (probes, gating, library). Load the stage skills with
     `runs/<task>/promote.md`: what the banked tree changed vs the base, with
     the edit rows and experience attached, classified for the live profile
     (skills install, SOUL.md/hermes.md review, config.yaml never promoted).
-    Hand the report to the user and let them apply what they approve. The
-    tool never writes the live profile.
+    Carry the report over per the profile's standing promote policy: when the
+    profile directs it (e.g. its SOUL.md default-mode section), the agent
+    applies the report to the live profile itself — install the recommended
+    skills, carry over the review-classified lesson text, verify the applied
+    files, and report what landed; otherwise hand it to the user and let them
+    apply what they approve. The tool never writes the live profile.
 
 Consult the library first: `harness2_library` action=list before Propose,
 and show any entry that looks relevant. The library is this loop's
@@ -67,8 +71,9 @@ missing — re-probing an existing probe dir is safe (it is rebuilt fresh).
   profile with approvals off.
 - Each probe costs a full agent session. Confirm the task is worth it before
   starting, and prefer k=1 for a first round.
-- After the run is banked, hand over the promote report
-  (`runs/<task>/promote.md`) before any `gc` with `drop_runs`: the report
-  lives in the run directory and is the user's input to what gets applied
-  to the live profile.
+- After the run is banked, produce the promote report
+  (`runs/<task>/promote.md`) and carry it over before any `gc` with
+  `drop_runs`: the report lives in the run directory; the profile's standing
+  promote policy decides who carries it over — the agent (install +
+  carry-over + verify + report) when directed, the user otherwise.
 - After the run is banked, offer `harness2_gc` to remove the probe profiles.

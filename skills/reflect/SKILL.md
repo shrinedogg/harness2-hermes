@@ -43,4 +43,7 @@ line in place of the `<experience>` block.
 `experience_path: runs/<task>/reflection.md` (or `no_entry: true`). Then
 `harness2_promote` for the task: it writes the carry-over report
 (`runs/<task>/promote.md`) classifying each change for the live profile.
-Hand that report to the user; the user decides what to apply.
+Carry the report over per the profile's standing promote policy: the agent
+applies it to the live profile (install the recommended skills, carry over
+the lesson text, verify, report) when the profile directs it; otherwise the
+user decides what to apply.
