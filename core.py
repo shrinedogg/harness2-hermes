@@ -24,7 +24,36 @@ import sys
 import time
 from pathlib import Path
 
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError:  # docker-managed venv ships ruamel.yaml, not PyYAML
+    import io as _io
+
+    from ruamel.yaml import YAML as _RuamelYAML
+    from ruamel.yaml.error import YAMLError as _RuamelYAMLError
+
+    class _RuamelYamlShim:
+        """Minimal PyYAML-compatible surface (the only calls core.py makes).
+
+        ruamel preserves mapping insertion order by default; core.py always
+        passes sort_keys=False, so output matches PyYAML's behavior here.
+        """
+
+        YAMLError = _RuamelYAMLError
+
+        @staticmethod
+        def safe_load(stream):
+            return _RuamelYAML(typ="safe", pure=True).load(stream)
+
+        @staticmethod
+        def safe_dump(data, sort_keys=True):
+            y = _RuamelYAML(typ="safe", pure=True)
+            y.default_flow_style = False  # PyYAML-like block style
+            buf = _io.StringIO()
+            y.dump(data, buf)
+            return buf.getvalue()
+
+    yaml = _RuamelYamlShim()
 
 PLUGIN_NAME = "harness2"
 KEEP_BASE = "KEEP_BASE"
