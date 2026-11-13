@@ -6,11 +6,19 @@ bundled skills; this module is deterministic and side-effect limited to:
 
 - the plugin data directory (runs/, candidates/, library/), which survives
   plugin updates and follows the active profile;
-- Hermes probe profiles named harness2-* (created by the standard
-  ``hermes profile create --clone`` mechanism, refreshed on each probe);
+- Hermes probe profiles named harness2-* (created once by the standard
+  ``hermes profile create --clone`` mechanism, which carries the active
+  profile's config and .env under hermes' own clone policy, and refreshed on
+  each probe by applying the tree's overlay keys through
+  ``hermes -p <probe-profile> config set`` plus replacing SOUL.md / skills/);
 - spawning ``hermes -p <probe-profile> chat`` one-shot sessions (the probes).
 
 The installed plugin tree itself is never written to.
+
+YAML goes through PyYAML (declared in plugin.yaml as
+``python_dependencies`` and installed at plugin install time); hosts
+without PyYAML (the docker-managed venv ships ruamel.yaml instead) fall
+back to a minimal ruamel shim defined below.
 """
 from __future__ import annotations
 
@@ -25,7 +33,7 @@ import time
 from pathlib import Path
 
 try:
-    import yaml
+    import yaml  # PyYAML, declared in plugin.yaml (python_dependencies); installed at plugin install
 except ModuleNotFoundError:  # docker-managed venv ships ruamel.yaml, not PyYAML
     import io as _io
 
@@ -35,8 +43,9 @@ except ModuleNotFoundError:  # docker-managed venv ships ruamel.yaml, not PyYAML
     class _RuamelYamlShim:
         """Minimal PyYAML-compatible surface (the only calls core.py makes).
 
-        ruamel preserves mapping insertion order by default; core.py always
-        passes sort_keys=False, so output matches PyYAML's behavior here.
+        ruamel preserves mapping insertion order by default; the only
+        sort_keys call site in core.py passes sort_keys=False, so output
+        matches PyYAML's behavior here.
         """
 
         YAMLError = _RuamelYAMLError
@@ -112,7 +121,38 @@ def candidates_dir() -> Path:
 
 
 def _hermes_home() -> Path:
-    return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+    """Home of the active profile (its config.yaml, .env and skills/ live here)."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home())
+    except Exception:  # noqa: BLE001 - tests and direct use without the hermes core
+        return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+
+
+def _hermes_root() -> Path:
+    """Root that owns the profiles/ directory for the active profile."""
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        return Path(get_default_hermes_root(home=_hermes_home()))
+    except Exception:  # noqa: BLE001 - tests and direct use without the hermes core
+        return _hermes_home()
+
+
+def _profile_dirs() -> Path:
+    """Directory holding probe profile dirs (harness2-*)."""
+    return _hermes_root() / "profiles"
+
+
+def _run_hermes(args, timeout: int, env: dict | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [_hermes_exe()] + list(args),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+    )
 
 
 def _hermes_exe() -> str:
@@ -125,26 +165,6 @@ def _hermes_exe() -> str:
     raise H2Error("hermes executable not found on PATH; probes cannot run")
 
 
-def _run_hermes(args, timeout: int) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [_hermes_exe()] + list(args),
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-
-
-def deep_merge(base: dict, overlay: dict) -> dict:
-    """Overlay wins; dicts merge recursively (probe overlay semantics)."""
-    out = dict(base)
-    for k, v in overlay.items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = deep_merge(out[k], v)
-        else:
-            out[k] = v
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Tasks and candidate trees
 
@@ -153,6 +173,46 @@ def task_dir(task: str) -> Path:
     if not TASK_RE.match(task or ""):
         raise H2Error(f"invalid task slug {task!r}: use lowercase [a-z0-9-], 1-64 chars")
     return runs_dir() / task
+
+
+def _validate_source_dir(raw: str) -> Path:
+    """Resolve and refuse a model-named source_dir that could leak secrets.
+
+    A full-tool probe agent reads the copied material, so the source must
+    live under the session's working directory and must not pass through
+    the Hermes home/root (config.yaml, .env, state.db), a credential dir
+    under the OS home, or any dot-dir.
+    """
+    p = Path(raw).expanduser()
+    if not p.is_dir():
+        raise H2Error(f"source_dir not found: {p}")
+    try:
+        resolved = p.resolve()
+    except OSError:
+        raise H2Error(f"source_dir not found: {p}")
+    cwd = Path(os.getcwd()).resolve()
+    if not resolved.is_relative_to(cwd):
+        raise H2Error(
+            f"source_dir {p} is outside the session's working directory {cwd}; "
+            "only directories under the working directory may be copied into probe workspaces"
+        )
+    blocked: dict[str, Path] = {
+        "the Hermes home": _hermes_home().expanduser(),
+        "the Hermes root": _hermes_root().expanduser(),
+    }
+    home = Path.home()
+    for name in ("ssh", "aws", "gnupg", "kube", "docker"):
+        blocked[f"credential dir {home}/{name}"] = home / name
+    for label, base in blocked.items():
+        try:
+            resolved.relative_to(base)
+        except ValueError:
+            continue
+        raise H2Error(f"source_dir {p} is inside {label} ({base}); refusing")
+    for part in resolved.parts[1:]:
+        if part.startswith("."):
+            raise H2Error(f"source_dir {p} passes through a dot-dir ({part}); refusing")
+    return resolved
 
 
 def init_task(task: str, task_text: str, source_dir: str | None = None) -> dict:
@@ -165,9 +225,7 @@ def init_task(task: str, task_text: str, source_dir: str | None = None) -> dict:
     d.mkdir(parents=True, exist_ok=True)
     (d / "task.md").write_text(text + "\n")
     if source_dir:
-        src = Path(source_dir).expanduser()
-        if not src.is_dir():
-            raise H2Error(f"source_dir not found: {src}")
+        src = _validate_source_dir(source_dir)
         dst = d / "source"
         if dst.exists():
             shutil.rmtree(dst)
@@ -198,9 +256,19 @@ def resolve_tree(task: str, ref: str) -> Path:
     if ref == "base":
         return base_tree()
     if ref.startswith("candidate:"):
-        p = candidates_dir() / f"{task}-{ref.split(':', 1)[1]}"
+        cid = ref.split(":", 1)[1]
+        if not ID_RE.match(cid or ""):
+            raise H2Error(
+                f"invalid candidate id {cid!r} in {ref!r}: use lowercase [a-z0-9-], 1-32 chars"
+            )
+        p = candidates_dir() / f"{task}-{cid}"
     elif ref.startswith("library:"):
-        p = data_root() / "library" / "entries" / ref.split(":", 1)[1] / "harness"
+        entry = ref.split(":", 1)[1]
+        if not TASK_RE.match(entry or ""):
+            raise H2Error(
+                f"invalid library entry {entry!r} in {ref!r}: use lowercase [a-z0-9-], 1-64 chars"
+            )
+        p = data_root() / "library" / "entries" / entry / "harness"
     else:
         raise H2Error("tree must be 'base', 'candidate:<id>' or 'library:<entry>'")
     if not (p / "SOUL.md").exists():
@@ -234,170 +302,44 @@ def profile_name(task: str, probe_id: str) -> str:
 # gateway's adapters as a second consumer of the active profile's bot tokens
 # (the multiplexer would stamp a fatal duplicate_credential verdict per
 # platform and flip the desktop health pill, which ignores only
-# disabled/not_configured states).
-
-
-_ENV_LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
-
-# Last-resort strip set, used only when the hermes source is not importable at
-# all: the six core token names of gateway/config.py::PLATFORM_TOKEN_ENV_NAMES.
-_CORE_PLATFORM_TOKENS = (
-    "TELEGRAM_BOT_TOKEN",
-    "DISCORD_BOT_TOKEN",
-    "SLACK_BOT_TOKEN",
-    "MATTERMOST_TOKEN",
-    "MATRIX_ACCESS_TOKEN",
-    "WEIXIN_TOKEN",
-)
-
-
-def _fallback_credential_keys() -> dict[str, str]:
-    """``{ENV_KEY: platform_id}`` from the hermes credential sources without the
-    full clone machinery (which also needs the plugin registry):
-    gateway/config.py::PLATFORM_TOKEN_ENV_NAMES plus
-    hermes_cli/profile_channels.py::credential_env_keys (core
-    _ENV_ENABLE_CREDENTIALS, plugin ENV_ENABLE_CREDENTIALS and EnvCred rows)."""
-    keys: dict[str, str] = {}
-    try:
-        from gateway.config import PLATFORM_TOKEN_ENV_NAMES
-
-        for platform, name in PLATFORM_TOKEN_ENV_NAMES.items():
-            keys[name] = getattr(platform, "value", str(platform))
-    except Exception:  # noqa: BLE001 - a read failure just narrows the strip set
-        pass
-    try:
-        from hermes_cli.profile_channels import credential_env_keys
-
-        for key, pid in credential_env_keys().items():
-            keys.setdefault(key, str(pid))
-    except Exception:  # noqa: BLE001
-        pass
-    return keys
-
-
-def strip_platform_env(env_path: Path, source: Path) -> dict[str, list[str]]:
-    """Drop the gateway platform-adapter lines from a copied profile ``.env``.
-
-    Primary is hermes' own clone policy (``hermes_cli.profile_channels``): the
-    same ownership rules ``hermes profile create --clone`` applies so a second
-    profile can never consume the source's bot credentials - declared
-    credential keys, adapter policy/config keys and every ``<PLATFORM>_``
-    prefix (so MATRIX_ALLOWED_USERS and friends go with the tokens). Fallback
-    strips the declared credential set (exact key plus its platform prefix)
-    from the hermes sources. Either way comments, blank lines and every other
-    key (model keys, HERMES_CUSTOM_*, tool keys) survive verbatim. Returns
-    ``{platform: [keys removed]}``.
-    """
-    try:
-        from hermes_cli.profile_channels import ChannelKeyIndex, strip_channel_env_file
-
-        return strip_channel_env_file(env_path, ChannelKeyIndex(source))
-    except Exception:  # noqa: BLE001 - clone machinery unavailable: degrade
-        pass
-    keys = _fallback_credential_keys() or {
-        name: name.split("_", 1)[0].lower() for name in _CORE_PLATFORM_TOKENS
-    }
-    prefixes = sorted({name.split("_", 1)[0] + "_" for name in keys})
-    kept: list[str] = []
-    removed: dict[str, list[str]] = {}
-    text = env_path.read_text(encoding="utf-8-sig", errors="replace")
-    for line in text.splitlines():
-        m = _ENV_LINE_RE.match(line)
-        key = m.group(1) if m else None
-        owner = None
-        if key is not None and not key.startswith("HERMES_CUSTOM_"):
-            owner = keys.get(key) or next(
-                (p.rstrip("_").lower() for p in prefixes if key.startswith(p)), None
-            )
-        if key is None or owner is None:
-            kept.append(line)
-        else:
-            removed.setdefault(owner, []).append(key)
-    if removed:
-        env_path.write_text("\n".join(kept) + ("\n" if text.endswith("\n") or kept else ""), encoding="utf-8")
-    return removed
-
-
-def _platform_block_names(gateway: dict) -> list[str]:
-    """``gateway:`` keys that are platform shorthand blocks (``gateway.<platform>:``),
-    judged by hermes' own Platform enum when it is importable."""
-    try:
-        from gateway.config import Platform
-
-        names = {m.value for m in Platform.__members__.values() if m.value != "local"}
-    except Exception:  # noqa: BLE001 - degrade: skip the shorthand spelling
-        return []
-    return [k for k in gateway if k in names]
-
-
-def _disable_platforms(merged: dict) -> None:
-    """Set ``enabled: false`` for every platform the merged config has enabled, in
-    all three spellings the gateway loader reads (``platforms.<p>``,
-    ``gateway.platforms.<p>``, ``gateway.<p>``). The probe profile never runs
-    gateway adapters: an explicit disable beats env credentials at gateway
-    start, and the desktop health pill ignores disabled/not_configured states,
-    so no adapter starts and no duplicate_credential verdict can be stamped."""
-    def disable(section) -> None:
-        if not isinstance(section, dict):
-            return
-        for block in section.values():
-            if isinstance(block, dict) and block.get("enabled"):
-                block["enabled"] = False
-
-    disable(merged.get("platforms"))
-    gateway = merged.get("gateway")
-    if isinstance(gateway, dict):
-        disable(gateway.get("platforms"))
-        for key in _platform_block_names(gateway):
-            block = gateway.get(key)
-            if isinstance(block, dict) and block.get("enabled"):
-                block["enabled"] = False
+# disabled/not_configured states). That isolation belongs to hermes' own
+# clone policy: ``hermes profile create --clone`` decides which credentials
+# a second profile may carry and strips the source's bot-channel tokens. So
+# this plugin copies no secret files at all - the clone carries the active
+# profile's config and .env once, and every refresh after the first only
+# applies overlay keys through ``hermes -p <profile> config set``.
 
 
 def materialize_profile(tree: Path, profile: str, budget: int) -> Path:
     """Create-once / refresh-on-use materialization of a tree as a profile.
 
-    First use: ``hermes profile create --clone <name>`` (inherits the active
-    profile's model wiring). Every use: deep-merge the tree's config overlay
-    over the active profile config, pin the run budget, replace SOUL.md and
-    skills/ with the tree's.
-
-    The probe profile can never be a second consumer of the gateway's platform
-    credentials: the copied ``.env`` is stripped of the platform-adapter lines
-    (model keys and HERMES_CUSTOM_* survive byte-for-byte) and every platform
-    the merged config has enabled is set ``enabled: false``. Both steps run on
-    every materialization, not just the first.
+    First use: ``hermes profile create --clone <name>`` with HERMES_HOME
+    pinned to the active profile's home, so the child can never clone from a
+    different profile. The clone carries the active profile's config and
+    .env once, under hermes' own clone policy. Every use: the tree's
+    overlay keys and the run budget are applied one key at a time through
+    ``hermes -p <profile> config set`` - the plugin never rewrites the
+    profile's config.yaml or touches its .env - and SOUL.md and skills/ are
+    replaced with the tree's.
     """
     home = _hermes_home()
-    dst = home / "profiles" / profile
+    dst = _profile_dirs() / profile
     if not dst.exists():
-        r = _run_hermes(["profile", "create", "--clone", profile], timeout=300)
+        env = {**os.environ, "HERMES_HOME": str(home)}
+        r = _run_hermes(["profile", "create", "--clone", profile], timeout=300, env=env)
         if r.returncode != 0 or not dst.exists():
             raise H2Error(
                 f"hermes profile create --clone {profile} failed: "
                 f"{(r.stderr or r.stdout).strip()[:500]}"
             )
 
-    active_cfg = home / "config.yaml"
-    active = yaml.safe_load(active_cfg.read_text()) if active_cfg.exists() else None
-    active = active if isinstance(active, dict) else {}
     overlay_path = tree / "config.yaml"
     overlay = yaml.safe_load(overlay_path.read_text()) if overlay_path.exists() else None
     overlay = overlay if isinstance(overlay, dict) else {}
+    for key, value in _flatten_config(overlay).items():
+        _set_probe_config(profile, key, value)
+    _set_probe_config(profile, "agent.run_budget_seconds", str(int(budget)))
 
-    merged = deep_merge(active, overlay)
-    agent = merged.setdefault("agent", {})
-    if not isinstance(agent, dict):
-        merged["agent"] = agent = {}
-    agent["run_budget_seconds"] = int(budget)
-    _disable_platforms(merged)
-    (dst / "config.yaml").write_text(yaml.safe_dump(merged, sort_keys=False))
-
-    env_src = home / ".env"
-    if env_src.exists():
-        env_dst = dst / ".env"
-        shutil.copy2(env_src, env_dst)
-        strip_platform_env(env_dst, home)
     soul = tree / "SOUL.md"
     if soul.exists():
         shutil.copy2(soul, dst / "SOUL.md")
@@ -411,6 +353,43 @@ def materialize_profile(tree: Path, profile: str, budget: int) -> Path:
         shutil.copytree(skills_src, skills_dst)
         skills = sorted(p.name for p in skills_dst.iterdir())
     return dst
+
+
+def _set_probe_config(profile: str, key: str, value: str) -> None:
+    """Apply one overlay key through the CLI; the profile's config.yaml stays
+    owned by the clone that created it."""
+    r = _run_hermes(["-p", profile, "config", "set", key, value], timeout=120)
+    if r.returncode != 0:
+        raise H2Error(
+            f"hermes config set {key} failed for profile {profile}: "
+            f"{(r.stderr or r.stdout).strip()[:300]}"
+        )
+
+
+def _flatten_config(cfg: dict) -> dict[str, str]:
+    """Dotted leaf keys -> CLI value strings for ``hermes config set``
+    (the CLI auto-coerces bools, ints and YAML/JSON literals)."""
+    out: dict[str, str] = {}
+
+    def walk(prefix: str, node: object) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(f"{prefix}.{k}" if prefix else str(k), v)
+        else:
+            out[prefix] = _config_value_str(node)
+
+    walk("", cfg)
+    return out
+
+
+def _config_value_str(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (list, dict)):
+        return json.dumps(value)
+    return str(value)
 
 
 def _final_reply(log: Path, limit: int = 400) -> str:
@@ -449,6 +428,14 @@ def run_probe(task: str, tree_ref: str, probe_id: str, budget: int, source_tag: 
     materialize_profile(tree, profile, budget)
 
     probe_dir = tdir / probe_id
+    probe_dir.mkdir(parents=True, exist_ok=True)
+    (probe_dir / ".meta.json").write_text(
+        json.dumps(
+            {"probe": probe_id, "profile": profile, "tree": tree_ref, "started": int(time.time())},
+            indent=2,
+        )
+        + "\n"
+    )
     ws = probe_dir / "ws"
     if ws.exists():
         shutil.rmtree(ws)
@@ -491,7 +478,7 @@ def run_probe(task: str, tree_ref: str, probe_id: str, budget: int, source_tag: 
         exit_code = -1
     duration = round(time.time() - started, 1)
 
-    prof_sessions = _hermes_home() / "profiles" / profile / "sessions"
+    prof_sessions = _profile_dirs() / profile / "sessions"
     if prof_sessions.is_dir():
         newest = sorted(prof_sessions.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
         if newest:
@@ -972,18 +959,44 @@ def status(task: str) -> dict:
     }
 
 
+def _recorded_profiles(task: str) -> list[str]:
+    """Probe profiles this plugin recorded creating, for the task's probes."""
+    d = task_dir(task)
+    names: list[str] = []
+    if d.is_dir():
+        for p in sorted(d.iterdir()):
+            if not p.is_dir():
+                continue
+            name: str | None = None
+            meta_p = p / ".meta.json"
+            if meta_p.exists():
+                try:
+                    name = json.loads(meta_p.read_text()).get("profile")
+                except (json.JSONDecodeError, OSError):
+                    name = None
+            if name is None and (p / "stdout.log").exists():
+                name = profile_name(task, p.name)
+            if name:
+                names.append(name)
+    return sorted(set(names))
+
+
 def gc(task: str | None = None, drop_profiles: bool = True, drop_runs: bool = False) -> dict:
     removed_profiles: list[str] = []
     removed_runs: list[str] = []
     if drop_profiles:
-        home = _hermes_home() / "profiles"
-        prefix = f"harness2-{task}-" if task else "harness2-"
-        if home.is_dir():
-            for p in sorted(home.iterdir()):
-                if p.is_dir() and p.name.startswith(prefix):
-                    r = _run_hermes(["profile", "delete", "-y", p.name], timeout=120)
-                    if r.returncode == 0 and not (home / p.name).exists():
-                        removed_profiles.append(p.name)
+        if not task:
+            raise H2Error(
+                "gc without a task would sweep every harness2-* profile in the root; "
+                "pass task=<slug> to delete only the probes this plugin recorded for that task"
+            )
+        env = {**os.environ, "HERMES_HOME": str(_hermes_home())}
+        for name in _recorded_profiles(task):
+            if not (_profile_dirs() / name).exists():
+                continue
+            r = _run_hermes(["profile", "delete", "-y", name], timeout=120, env=env)
+            if r.returncode == 0 and not (_profile_dirs() / name).exists():
+                removed_profiles.append(name)
     if drop_runs:
         if not task:
             raise H2Error("drop_runs requires a task slug")

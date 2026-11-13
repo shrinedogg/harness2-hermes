@@ -120,9 +120,15 @@ the anonymized deliverables.
 ## Safety
 
 - A probe is a one-shot session in a profile named
-  `harness2-<task>-<probe>`. The profile clones your active profile, so the
-  probe runs under your model and your keys.
-- The probe overlay pins `approvals.mode: smart` and
+  `harness2-<task>-<probe>`. The profile clones your active profile once,
+  so the probe runs under your model and your keys. The clone carries your
+  config and `.env` a single time, under Hermes' own clone policy; the
+  probe-specific overlay keys are then applied one at a time with
+  `hermes -p config set`. The plugin never rewrites the profile's
+  `config.yaml` or touches its `.env`.
+- The probe overlay pins `approvals.mode: smart`,
+  `approvals.single_query_mode: deny` and `approvals.cron_mode: deny`
+  (probes are one-shot sessions, so nothing auto-approves) plus
   `security.redact_secrets: true`. The plugin never relaxes approvals.
 - For a task you want to run offline, remove the `web` and `browser`
   toolsets from the `config.yaml` in the candidate tree before you probe
@@ -132,7 +138,8 @@ the anonymized deliverables.
 - The plugin writes only to its data directory and to the probe profiles.
   It never writes to its own files or to your live profile: the promote
   report is your input, and applying it is your step. `harness2_gc` removes
-  probe profiles and finished runs. It never touches the library.
+  only the probe profiles the plugin recorded creating for the task you
+  name, plus that task's run directory. It never touches the library.
 - The plugin makes no network calls and sends no telemetry. A probe does
   whatever its tools do.
 

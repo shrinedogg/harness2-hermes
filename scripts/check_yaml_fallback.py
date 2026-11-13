@@ -4,7 +4,8 @@
 Run from the repo root in any python (PyYAML-only, ruamel-only, or both):
     python scripts/check_yaml_fallback.py
 Prints one machine-readable verdict line and exits 0 on success, 1 on
-failure. Keeps the ruamel fallback path honest after core.py edits: the
+failure. Keeps the ruamel fallback path honest after core.py edits:
+PyYAML is declared in plugin.yaml (python_dependencies), but the
 docker-managed agent venv ships ruamel.yaml, not PyYAML, so the
 ModuleNotFoundError fallback is load-bearing there.
 """

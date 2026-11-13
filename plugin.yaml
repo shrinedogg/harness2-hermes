@@ -11,6 +11,8 @@ description: >-
   library that future tasks read before editing.
 tags: [self-improvement, meta-agent, automation, harness2]
 requires_hermes: ">=0.22.0"
+python_dependencies:
+  - PyYAML>=6,<7
 provides_tools:
   - harness2_init
   - harness2_probe

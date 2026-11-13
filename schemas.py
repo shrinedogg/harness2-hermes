@@ -22,7 +22,11 @@ INIT = {
             },
             "source_dir": {
                 "type": "string",
-                "description": "Optional absolute path to a directory of input material; copied into the run.",
+                "description": (
+                    "Optional absolute path to a directory of input material; copied "
+                    "into the run. Must be under the session's working directory and "
+                    "outside the Hermes home/root, home credential dirs and dot-dirs."
+                ),
             },
         },
         "required": ["task", "task_text"],
@@ -200,18 +204,23 @@ STATUS = {
 GC = {
     "name": "harness2_gc",
     "description": (
-        "Clean up Harness^2 state. Removes probe profiles (harness2-*; scoped to one "
-        "task when task is given), and optionally deletes a finished task's run "
-        "directory (drop_runs). The library is never touched. Use after a run is done "
-        "and its harness has been banked, to reclaim profile clutter."
+        "Clean up Harness^2 state. With a task slug, deletes only the probe "
+        "profiles this plugin recorded creating for that task's probes, and "
+        "optionally deletes the finished task's run directory (drop_runs). "
+        "Without a task it refuses to sweep the root's whole harness2-* set. "
+        "The library is never touched. Use after a run is done and its "
+        "harness has been banked, to reclaim profile clutter."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "task": {"type": "string", "description": "Optional task slug to scope profile removal."},
+            "task": {
+                "type": "string",
+                "description": "Task slug; required to delete probe profiles.",
+            },
             "drop_profiles": {
                 "type": "boolean",
-                "description": "Delete probe profiles (default true).",
+                "description": "Delete the task's recorded probe profiles (default true; requires task).",
             },
             "drop_runs": {
                 "type": "boolean",

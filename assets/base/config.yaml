@@ -1,9 +1,11 @@
-# Probe overlay. Deep-merged over the active profile's config at
-# materialize time, so model wiring and credentials are inherited and only
-# these probe-specific keys differ.
+# Probe overlay. Applied to the probe profile one leaf key at a time via
+# `hermes -p <probe> config set`, so the profile's own config.yaml and
+# .env stay owned by the clone that created them.
 agent:
   max_turns: 60
 approvals:
   mode: smart
+  single_query_mode: deny
+  cron_mode: deny
 security:
   redact_secrets: true
